@@ -1,13 +1,15 @@
 import tls_client
 import requests
 import secrets
-import threading
 import yaml
 import random
+import threading
 import sys
+import time
 import concurrent.futures
 
-from datetime import datetime
+from tls_client.exceptions import TLSClientExeption
+from colorama import Fore, Style
 
 user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 OPR/107.0.0.0"
 thread_lock = threading.Lock()
@@ -42,9 +44,21 @@ class Utils:
             if "ready" in response.text:
                 return response.json()["solution"]["gRecaptchaResponse"]
             elif "processing" in response.text:
-                continue
+                time.sleep(1)
             else:
                 raise Exception("Failed to solve captcha.")
+
+
+class Logger:
+    @staticmethod
+    def info(content):
+        message = f'{Fore.GREEN}{Style.BRIGHT}[+]{Style.RESET_ALL} {Fore.RESET}{content}{Fore.RESET}'
+        sys.stdout.write(message + "\n")
+
+    @staticmethod
+    def error(content):
+        message = f'{Fore.RED}{Style.BRIGHT}[!]{Style.RESET_ALL} {Fore.RESET}{content}{Fore.RESET}'
+        sys.stdout.write(message + "\n")
 
 
 class GeneratePromo:
@@ -56,7 +70,7 @@ class GeneratePromo:
             client_identifier="opera_107",
             random_tls_extension_order=True
         )
-        self.session.timeout_seconds = 10
+        self.session.timeout_seconds = 5
         if config["proxies"] and proxies:
             proxy = random.choice(proxies)
             self.session.proxies = {
@@ -96,8 +110,10 @@ class GeneratePromo:
         }
 
 
-    def signup(self):
-        solution = Utils.solve_recaptcha()
+    def signup(self, solution, tries=1):
+        if tries > 15:
+            raise Exception("Failed to create account.")
+
         self.email = f"{secrets.token_hex(6)}@gmail.com"
         self.password = secrets.token_hex(8)
 
@@ -110,34 +126,51 @@ class GeneratePromo:
             "captcha": solution
         }
 
-        response = self.session.post("https://auth.opera.com/account/v4/api/signup", headers=self.post_headers, json=payload)
-        self.post_headers["X-Csrftoken"] = response.headers["X-Opera-Csrf-Token"]
+        try:
+            response = self.session.post("https://auth.opera.com/account/v4/api/signup", headers=self.post_headers, json=payload)
+        except TLSClientExeption:
+            return self.signup(solution, tries + 1)
 
+        if response.status_code == 429:
+            raise Exception("Rate limited.")
 
+        if response.status_code == 200:
+            self.post_headers["X-Csrftoken"] = response.headers["X-Opera-Csrf-Token"]
+            self.session.patch("https://auth.opera.com/api/v1/profile", headers=self.post_headers, json={"username": secrets.token_hex(6)})
+        else:
+            raise Exception("Failed to create account.")
 
-    def login(self):
-        self.session.get("https://api.gx.me/session/login?site=gxme&target=%2F", headers=self.get_headers)
-        response = self.session.get("https://api.gx.me/oauth2/authorization/opera", headers=self.get_headers)
-        location = response.headers["Location"]
+    def login(self, tries=1):
+        if tries > 15:
+            raise Exception("Failed to get session token.")
+        try:
+            self.session.get("https://api.gx.me/session/login?site=gxme&target=%2F", headers=self.get_headers)
+            response = self.session.get("https://api.gx.me/oauth2/authorization/opera", headers=self.get_headers)
+            location = response.headers["Location"]
 
-        response = self.session.get(location, headers=self.get_headers)
+            response = self.session.get(location, headers=self.get_headers)
+            new_location = response.headers["Location"]
+            self.session.get(new_location, headers=self.get_headers)
 
-        new_location = response.headers["Location"]
-        self.session.get(new_location, headers=self.get_headers)
+            response = self.session.get("https://auth.opera.com/account/login-redirect?service=gmx", headers=self.get_headers)
+            authorize_location = response.headers["Location"]
 
-        response = self.session.get("https://auth.opera.com/account/login-redirect?service=gmx", headers=self.get_headers)
-        authorize_location = response.headers["Location"]
+            response = self.session.get(authorize_location, headers=self.get_headers)
+            login_location = response.headers["Location"]
 
-        response = self.session.get(authorize_location, headers=self.get_headers)
-        login_location = response.headers["Location"]
+            response = self.session.get(login_location, headers=self.get_headers)
+        except TLSClientExeption:
+            return self.login(tries + 1)
 
-        self.session.get(login_location, headers=self.get_headers)
+        self.session.cookies = response.cookies
+        self.session.cookies.set(
+            name="SESSION_TYPE",
+            value="user"
+        )
 
-
-    def pull_promo(self):
-        self.session.cookies.pop("__Host-psid")
-        self.session.cookies.pop("__Host-csrftoken")
-        self.session.cookies.pop("__Host-sessionid")
+    def pull_promo(self, tries=1):
+        if tries > 15:
+            raise Exception("Failed to pull promo.")
 
         headers = {
             "Accept": "application/json",
@@ -152,16 +185,19 @@ class GeneratePromo:
             "Sec-Fetch-Site": "cross-site",
             "User-Agent": user_agent
         }
+        try:
+            response = self.session.get("https://api.gx.me/profile/token", headers=headers)
+            headers.update({
+                "Authorization": response.json()["data"]
+            })
+            self.session.cookies.clear()
 
-        response = self.session.get("https://api.gx.me/profile/token", headers=headers)
+            response = self.session.post("https://discord.opr.gg/v2/direct-fulfillment", headers=headers)
+            token = response.json()["token"]
 
-        headers.update({
-            "Authorization": response.json()["data"]
-        })
-        self.session.cookies.clear()
+        except TLSClientExeption:
+            return self.pull_promo(tries + 1)
 
-        response = self.session.post("https://discord.opr.gg/v2/direct-fulfillment", headers=headers)
-        token = response.json()["token"]
         thread_lock.acquire()
         with open("./output/promos.txt", "a") as f:
             f.write(
@@ -170,19 +206,20 @@ class GeneratePromo:
         thread_lock.release()
 
 
+
 # -- Main --
 
 def generate_promo():
     try:
         gen = GeneratePromo()
-        gen.signup()
-        print(f"<+> Successfully generated OperaGX account | Email: {gen.email}")
+        solution = Utils.solve_recaptcha()
+        gen.signup(solution)
+        Logger.info(f"Successfully generated OperaGX account | Email: {gen.email}")
         gen.login()
         gen.pull_promo()
-        print(f"<+> Successfully pulled promo link | Email: {gen.email}")
+        Logger.info(f"Successfully pulled promo link | Email: {gen.email}")
     except Exception as e:
-        # print(f"<!> {str(e)}")
-        pass
+        Logger.error(f"{str(e)}")
 
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=config["threads"]) as executor:
