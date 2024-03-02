@@ -1,0 +1,3 @@
+proxies: true
+threads: 50
+capsolver-api-key: ""
